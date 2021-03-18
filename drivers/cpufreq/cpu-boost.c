@@ -38,7 +38,7 @@ static struct kthread_work input_boost_work;
 
 static bool input_boost_enabled;
 
-static unsigned int input_boost_ms = 40;
+static unsigned int input_boost_ms = 70;
 module_param(input_boost_ms, uint, 0644);
 
 static unsigned int sched_boost_on_input;
@@ -52,7 +52,7 @@ static u64 last_input_time;
 static struct kthread_worker cpu_boost_worker;
 static struct task_struct *cpu_boost_worker_thread;
 
-#define MIN_INPUT_INTERVAL (100 * USEC_PER_MSEC)
+#define MIN_INPUT_INTERVAL (130 * USEC_PER_MSEC)
 
 static int set_input_boost_freq(const char *buf, const struct kernel_param *kp)
 {
