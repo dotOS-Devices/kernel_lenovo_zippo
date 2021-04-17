@@ -42,6 +42,7 @@
 #include "sde_power_handle.h"
 #include "sde_core_perf.h"
 #include "sde_trace.h"
+#include "dsi_display.h"
 
 #define SDE_PSTATES_MAX (SDE_STAGE_MAX * 4)
 #define SDE_MULTIRECT_PLANE_MAX (SDE_STAGE_MAX * 2)
@@ -2142,6 +2143,10 @@ static void _sde_crtc_blend_setup_mixer(struct drm_crtc *crtc,
 		for (i = 0; i < cstate->num_dim_layers; i++)
 			_sde_crtc_setup_dim_layer_cfg(crtc, sde_crtc,
 					mixer, &cstate->dim_layer[i]);
+
+		if (cstate->fod_dim_layer)
+			_sde_crtc_setup_dim_layer_cfg(crtc, sde_crtc,
+					mixer, cstate->fod_dim_layer);
 	}
 
 	_sde_crtc_program_lm_output_roi(crtc);
@@ -5261,6 +5266,120 @@ static int _sde_crtc_check_secure_state(struct drm_crtc *crtc,
 	return 0;
 }
 
+extern bool is_dimlayer_bl_enable;
+extern bool is_dimlayer_hbm_enabled;
+extern int dimlayer_hbm_is_single_layer;
+extern int chen_need_active_hbm_next_frame;
+static struct sde_hw_dim_layer* sde_crtc_setup_fod_dim_layer(
+		struct sde_crtc_state *cstate,
+		uint32_t stage)
+{
+	struct drm_crtc_state *crtc_state = &cstate->base;
+	struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	struct sde_hw_dim_layer *dim_layer = NULL;
+	struct dsi_display *display;
+	struct sde_kms *kms;
+	uint32_t layer_stage;
+	uint32_t alpha;
+
+	kms = _sde_crtc_get_kms(crtc_state->crtc);
+	if (!kms || !kms->catalog) {
+		SDE_ERROR("Invalid kms\n");
+		goto error;
+	}
+
+	layer_stage = SDE_STAGE_0 + stage;
+	if (layer_stage >= kms->catalog->mixer[0].sblk->maxblendstages) {
+		SDE_ERROR("Stage too large %u vs max %u\n", layer_stage,
+			kms->catalog->mixer[0].sblk->maxblendstages);
+		goto error;
+	}
+
+	if (cstate->num_dim_layers == SDE_MAX_DIM_LAYERS) {
+		SDE_ERROR("Max dim layers reached\n");
+		goto error;
+	}
+
+	display = get_main_display();
+	if (!display || !display->panel) {
+		SDE_ERROR("Invalid primary display\n");
+		goto error;
+	}
+
+	mutex_lock(&display->panel->panel_lock);
+	alpha = dsi_panel_get_fod_dim_alpha(display->panel);
+	if (is_dimlayer_bl_enable && !is_dimlayer_hbm_enabled) {
+		alpha = display->panel->doze_enabled ? 0 : dsi_panel_get_bl_dim_alpha(display->panel);
+	}
+	mutex_unlock(&display->panel->panel_lock);
+
+	dim_layer = &cstate->dim_layer[cstate->num_dim_layers];
+	dim_layer->flags = SDE_DRM_DIM_LAYER_INCLUSIVE;
+	dim_layer->stage = layer_stage;
+	dim_layer->rect.x = 0;
+	dim_layer->rect.y = 0;
+	dim_layer->rect.w = mode->hdisplay;
+	dim_layer->rect.h = mode->vdisplay;
+	dim_layer->color_fill =
+			(struct sde_mdss_color) {0, 0, 0, alpha};
+
+error:
+	return dim_layer;
+}
+
+static void sde_crtc_fod_atomic_check(struct sde_crtc_state *cstate,
+		struct plane_state *pstates, int cnt)
+{
+	uint32_t dim_layer_stage;
+	int fod_layer_index = -1;
+	int plane_idx;
+	int zpos = INT_MAX;
+
+    for (plane_idx = 0; plane_idx < cnt; plane_idx++) {
+		if (sde_plane_is_fod_layer(pstates[plane_idx].drm_pstate)) {
+			fod_layer_index = plane_idx;
+		}
+		dimlayer_hbm_is_single_layer = cnt == 1 ? 1 : 0;
+    
+    }
+      if (is_dimlayer_hbm_enabled && dimlayer_hbm_is_single_layer && fod_layer_index == -1 && cnt > 0) {
+        if (chen_need_active_hbm_next_frame) {
+        	fod_layer_index = chen_need_active_hbm_next_frame ? 1 : -1;
+        }
+    }
+  
+    if (is_dimlayer_bl_enable || is_dimlayer_hbm_enabled) {
+        if (fod_layer_index >= 0) {
+            if (zpos > pstates[fod_layer_index].stage)
+                zpos = pstates[fod_layer_index].stage;
+            pstates[fod_layer_index].stage++;
+        }
+        
+        for (plane_idx = 0; plane_idx < cnt; plane_idx++) {
+            if (plane_idx == fod_layer_index)
+                continue;
+            if (pstates[plane_idx].stage >= zpos) {
+                pstates[plane_idx].stage++;
+            }
+        }
+        
+        if (zpos == INT_MAX) {
+            zpos = 0;
+            for (plane_idx = 0; plane_idx < cnt; plane_idx++) {
+                if (pstates[plane_idx].stage > zpos)
+                    zpos = pstates[plane_idx].stage;
+            }
+            zpos++;
+        }
+        cstate->fod_dim_layer = sde_crtc_setup_fod_dim_layer(cstate, zpos);
+        
+        if (!cstate->fod_dim_layer)
+            return;
+    } else {
+        cstate->fod_dim_layer = NULL;
+    }
+}
+
 static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 		struct drm_crtc_state *state)
 {
@@ -5446,6 +5565,8 @@ static int sde_crtc_atomic_check(struct drm_crtc *crtc,
 			sde_plane_clear_multirect(pipe_staged[i]);
 		}
 	}
+
+	sde_crtc_fod_atomic_check(cstate, pstates, cnt);
 
 	/* assign mixer stages based on sorted zpos property */
 	if (cnt > 0)

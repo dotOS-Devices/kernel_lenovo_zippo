@@ -59,6 +59,8 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{}
 };
 
+struct dsi_display *primary_display;
+
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
 			u32 mask, bool enable)
 {
@@ -184,6 +186,7 @@ void dsi_rect_intersect(const struct dsi_rect *r1,
 	}
 }
 
+bool is_dimlayer_bl_enable;
 int dsi_display_set_backlight(struct drm_connector *connector,
 		void *display, u32 bl_lvl)
 {
@@ -212,9 +215,13 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 
 	bl_scale_ad = panel->bl_config.bl_scale_ad;
 	bl_temp = (u32)bl_temp * bl_scale_ad / MAX_AD_BL_SCALE_LEVEL;
+	
+	if (is_dimlayer_bl_enable) {
+		bl_temp = bl_temp > panel->bl_config.bl_dimlayer_dc_level ? bl_temp : panel->bl_config.bl_dimlayer_dc_level;
+	}
 
-	pr_debug("bl_scale = %u, bl_scale_ad = %u, bl_lvl = %u\n",
-		bl_scale, bl_scale_ad, (u32)bl_temp);
+	pr_debug("Art_Chen bl_scale = %u, bl_scale_ad = %u, bl_lvl = %u, is_dimlayer_bl_enable = %d\n",
+		bl_scale, bl_scale_ad, (u32)bl_temp, is_dimlayer_bl_enable);
 
 	rc = dsi_display_clk_ctrl(dsi_display->dsi_clk_handle,
 			DSI_CORE_CLK, DSI_CLK_ON);
@@ -5233,10 +5240,272 @@ error:
 	return rc;
 }
 
+static ssize_t sysfs_doze_status_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	status = panel->doze_enabled;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_doze_status_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	bool status;
+	int rc = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtobool(buf, &status);
+	if (rc) {
+		pr_err("%s: kstrtobool failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_status(panel, status);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
+static ssize_t sysfs_doze_mode_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	enum dsi_doze_mode_type doze_mode;
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	doze_mode = panel->doze_mode;
+	mutex_unlock(&panel->panel_lock);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", doze_mode);
+}
+
+static ssize_t sysfs_doze_mode_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	int rc = 0;
+	int mode;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	rc = kstrtoint(buf, 10, &mode);
+	if (rc) {
+		pr_err("%s: kstrtoint failed. rc=%d\n", __func__, rc);
+		return rc;
+	}
+
+	if (mode < DSI_DOZE_LPM || mode > DSI_DOZE_HBM) {
+		pr_err("%s: invalid value for doze mode\n", __func__);
+		return -EINVAL;
+	}
+
+	panel = display->panel;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_doze_mode(panel, (enum dsi_doze_mode_type) mode);
+	mutex_unlock(&panel->panel_lock);
+
+	return count;
+}
+
+static ssize_t sysfs_fod_ui_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+	bool status;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+	status = atomic_read(&display->fod_ui);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", status);
+}
+
+static ssize_t sysfs_dimlayer_bl_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+    return snprintf(buf, PAGE_SIZE, "%d\n", is_dimlayer_bl_enable);
+}
+
+static ssize_t sysfs_dimlayer_bl_write(struct device *dev,
+	struct device_attribute *attr, char *buf, size_t count)
+{
+    int enabled = 0;
+    sscanf(buf, "%d", &enabled);
+    is_dimlayer_bl_enable = enabled > 0;
+    return count;
+}
+int dimlayer_hbm_is_single_layer = 0;
+int chen_need_active_hbm_next_frame = 0;
+static ssize_t sysfs_dimlayer_hbm_is_single_layer_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+    return snprintf(buf, PAGE_SIZE, "%d\n", dimlayer_hbm_is_single_layer);
+}
+
+static ssize_t sysfs_chen_need_active_hbm_next_frame_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+    return snprintf(buf, PAGE_SIZE, "%d\n", chen_need_active_hbm_next_frame);
+}
+
+static ssize_t sysfs_chen_need_active_hbm_next_frame_write(struct device *dev,
+	struct device_attribute *attr, char *buf, size_t count)
+{
+    int enabled = 0;
+    sscanf(buf, "%d", &enabled);
+    chen_need_active_hbm_next_frame = enabled > 0 ? 1 : 0;
+    return count;
+}
+
+bool is_dimlayer_hbm_enabled;
+static ssize_t sysfs_dimlayer_hbm_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+    return snprintf(buf, PAGE_SIZE, "%d\n", is_dimlayer_hbm_enabled);
+}
+
+static ssize_t sysfs_dimlayer_hbm_write(struct device *dev,
+	struct device_attribute *attr, char *buf, size_t count)
+{
+    int enabled = 0;
+    sscanf(buf, "%d", &enabled);
+    is_dimlayer_hbm_enabled = enabled > 0;
+    return count;
+}
+
+bool is_fod_hbm_enabled;
+static ssize_t sysfs_fod_hbm_en_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+    return snprintf(buf, PAGE_SIZE, "%d\n", is_fod_hbm_enabled);
+}
+
+static ssize_t sysfs_fod_hbm_en_write(struct device *dev,
+	struct device_attribute *attr, char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	int rc = 0;
+    int enabled = 0;
+
+	display = dev_get_drvdata(dev);
+	if (!display) {
+		pr_err("Invalid display\n");
+		return -EINVAL;
+	}
+
+    sscanf(buf, "%d", &enabled);
+
+	panel = display->panel;
+	
+	is_fod_hbm_enabled = enabled > 0;
+
+	mutex_lock(&panel->panel_lock);
+	dsi_panel_set_fod_hbm(panel, is_fod_hbm_enabled);
+	mutex_unlock(&panel->panel_lock);
+
+    return count;
+}
+
+static DEVICE_ATTR(dimlayer_bl, 0664,
+			sysfs_dimlayer_bl_read,
+			sysfs_dimlayer_bl_write);
+
+static DEVICE_ATTR(dimlayer_hbm, 0664,
+			sysfs_dimlayer_hbm_read,
+			sysfs_dimlayer_hbm_write);
+			
+static DEVICE_ATTR(doze_status, 0644,
+			sysfs_doze_status_read,
+			sysfs_doze_status_write);
+
+static DEVICE_ATTR(doze_mode, 0644,
+			sysfs_doze_mode_read,
+			sysfs_doze_mode_write);
+
+static DEVICE_ATTR(fod_ui, 0444,
+			sysfs_fod_ui_read,
+			NULL);
+
+static DEVICE_ATTR(fod_hbm_en, 0664,
+			sysfs_fod_hbm_en_read,
+			sysfs_fod_hbm_en_write);
+
+static DEVICE_ATTR(chen_need_active_hbm_next_frame, 0664,
+			sysfs_chen_need_active_hbm_next_frame_read,
+			sysfs_chen_need_active_hbm_next_frame_write);
+
+static DEVICE_ATTR(dimlayer_hbm_is_single_layer, 0444,
+			sysfs_dimlayer_hbm_is_single_layer_read,
+			NULL);
+
+static struct attribute *display_fs_attrs[] = {
+	&dev_attr_doze_status.attr,
+	&dev_attr_doze_mode.attr,
+	&dev_attr_fod_ui.attr,
+	&dev_attr_dimlayer_bl.attr,
+	&dev_attr_dimlayer_hbm.attr,
+	&dev_attr_fod_hbm_en.attr,
+	&dev_attr_chen_need_active_hbm_next_frame.attr,
+	&dev_attr_dimlayer_hbm_is_single_layer.attr,
+	NULL,
+};
+static struct attribute_group display_fs_attrs_group = {
+	.attrs = display_fs_attrs,
+};
+
 static int dsi_display_sysfs_init(struct dsi_display *display)
 {
 	int rc = 0;
 	struct device *dev = &display->pdev->dev;
+
+	rc = sysfs_create_group(&dev->kobj, &display_fs_attrs_group);
+	if (rc)
+		pr_err("failed to create display device attributes");
 
 	if (display->panel->panel_mode == DSI_OP_CMD_MODE)
 		rc = sysfs_create_group(&dev->kobj,
@@ -5256,6 +5525,13 @@ static int dsi_display_sysfs_deinit(struct dsi_display *display)
 
 	return 0;
 
+}
+
+void dsi_display_set_fod_ui(struct dsi_display *display, bool status)
+{
+	struct device *dev = &display->pdev->dev;
+	atomic_set(&display->fod_ui, status);
+	sysfs_notify(&dev->kobj, NULL, "fod_ui");
 }
 
 /**
@@ -5554,6 +5830,7 @@ static void dsi_display_unbind(struct device *dev,
 	}
 
 	atomic_set(&display->clkrate_change_pending, 0);
+	atomic_set(&display->fod_ui, false);
 	(void)dsi_display_sysfs_deinit(display);
 	(void)dsi_display_debugfs_deinit(display);
 
@@ -6593,6 +6870,7 @@ int dsi_display_get_modes(struct dsi_display *display,
 exit:
 	*out_modes = display->modes;
 	rc = 0;
+	primary_display = display;
 
 error:
 	if (rc)
@@ -7977,6 +8255,10 @@ int dsi_display_unprepare(struct dsi_display *display)
 
 	SDE_EVT32(SDE_EVTLOG_FUNC_EXIT);
 	return rc;
+}
+
+struct dsi_display *get_main_display(void) {
+	return primary_display;
 }
 
 static int __init dsi_display_register(void)
